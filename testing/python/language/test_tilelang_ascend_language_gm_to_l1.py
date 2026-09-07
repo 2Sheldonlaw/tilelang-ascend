@@ -801,3 +801,83 @@ def test_splice_2way_nz_dynamic_split_multi():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# =============================================================================
+# Group 10 - Partial-row GM -> L1 load into a larger Mat tile   [risk: high]
+# Regression guard for the PTO backend (issue #1273 class of failures).
+#
+# A GM -> L1 copy that transfers fewer rows than the destination L1 buffer
+# (e.g. loading Q_BATCH of M rows) used to be emitted with an L1 Mat tile
+# template sized to the *slice*.  L1 Mat tiles have an NZ-fractal physical
+# layout whose column stride equals the tile's Rows template parameter, so
+# the shrunken tile stored the valid rows with the wrong column stride while
+# the later L1 -> L0A extract read the buffer with the full-tile stride,
+# silently corrupting the mma result (xattention PTO precision failure).
+#
+# The fix records each buffer's pre-flatten trailing two dims and emits the
+# destination tile with the logical tile dims; the helper then takes the
+# useTail path (TFILLPAD zero-fills the untouched rows).  This test loads a
+# 64-row source into a [128, 128] L1 buffer, runs a full-tile
+# mma, and stores a partial row window back to GM.
+# =============================================================================
+def partial_row_load_mma(M, N, K, Q_BATCH, P_GM_COLS, dtype, accum_dtype):
+    @T.prim_func
+    def main(
+        P: T.Tensor((M, P_GM_COLS), dtype),  # type: ignore
+        V: T.Tensor((4096, N), dtype),  # type: ignore
+        O: T.Tensor((M, N), accum_dtype),  # type: ignore
+    ):
+        with T.Kernel(1, is_npu=True) as (cid, vid):
+            p_l1 = T.alloc_L1((M, K), dtype)
+            v_l1 = T.alloc_L1((K, N), dtype)
+            l0a = T.alloc_L0A((M, K), dtype)
+            l0b = T.alloc_L0B((K, N), dtype)
+            l0c = T.alloc_L0C((M, N), accum_dtype)
+            with T.Scope("C"):
+                T.copy(P[0:Q_BATCH, 0:K], p_l1[0:Q_BATCH, 0:K])
+                T.copy(V[0:K, 0:N], v_l1)
+                T.pipe_barrier("all")
+                T.copy(p_l1, l0a)
+                T.copy(v_l1, l0b)
+                T.pipe_barrier("all")
+                T.mma(l0a, l0b, l0c, init=True)
+                T.pipe_barrier("all")
+                T.copy(l0c[0:M, 0:N], O[0:Q_BATCH, :])
+                T.pipe_barrier("all")
+
+    return main
+
+
+@pytest.mark.skipif(
+    not (hasattr(torch, "npu") and torch.npu.is_available()),
+    reason="partial-row GM->L1 correctness requires an Ascend NPU runtime",
+)
+@pytest.mark.parametrize("target", ["ascendc", "pto"])
+@pytest.mark.parametrize("P_GM_COLS", [128, 512])
+def test_partial_row_load_mma(target, P_GM_COLS):
+    """Partial-row GM->L1 load (64 of 128 rows) followed by a full-tile mma.
+
+    P_GM_COLS=128 exercises a contiguous source; P_GM_COLS=512 exercises a
+    strided source (GM row stride != row length), both of which produced
+    corrupted mma results on the PTO backend before the fix."""
+    M, N, K, Q_BATCH = 128, 128, 128, 64
+    dtype, accum_dtype = "bfloat16", "float32"
+
+    func = partial_row_load_mma(M, N, K, Q_BATCH, P_GM_COLS, dtype, accum_dtype)
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=DEV_CONFIGS, target=target)
+    td = _torch_dtype(dtype)
+
+    torch.manual_seed(0)
+    P = torch.zeros(M, P_GM_COLS, dtype=td).npu()
+    P[:Q_BATCH, :K] = torch.randn(Q_BATCH, K, dtype=td).npu()
+    V = torch.randn(4096, N, dtype=td).npu()
+    torch.npu.synchronize()
+
+    O = func(P, V)
+    torch.npu.synchronize()
+
+    ref = torch.einsum("mk,kn->mn", P[:Q_BATCH, :K].float(), V[:K].float()).to(
+        torch.float32
+    )
+    torch.testing.assert_close(O[:Q_BATCH], ref, rtol=1e-2, atol=1e-2)

@@ -28,5 +28,12 @@ constexpr const char *kInitialBufferShapes = "initial_buffer_shapes";
 
 constexpr const char *kLogicBufferShapes = "logic_buffer_shapes";
 
+// Trailing two dims of each buffer's shape as observed *before* the
+// Flatten2DBuffer pass collapses leading dimensions into the row count.
+// For L1 Mat buffers this is the logical 2D tile (e.g. [4, 128, 128] ->
+// [128, 128]) whose fractal layout both the GM->L1 loads and the L1->L0
+// extracts must agree on.
+constexpr const char *kLogicBufferTileShapes = "logic_buffer_tile_shapes";
+
 } // namespace tl
 } // namespace tvm

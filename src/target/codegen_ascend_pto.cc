@@ -1299,6 +1299,43 @@ void CodeGenTileLangAscendPto::GMCopyCall(const CallNode *call,
       slice_info.is_slice ? slice_info.slice_valid_row : slice_info.row;
   int32_t shape5 =
       slice_info.is_slice ? slice_info.slice_valid_col : slice_info.col;
+  // copy_gm_to_l1: the destination is an L1 Mat tile (TileMatL1) whose
+  // physical NZ-fractal layout depends on the tile's Rows/Cols template
+  // parameters -- element (r, c) lives at r*16 + (c/16)*Rows*16 + c%16, so
+  // the column stride is Rows.  A load emitted with a tile template smaller
+  // than the logical tile (e.g. a partial-row slice loading Q_BATCH of M
+  // rows into an [M, K] buffer) stores the valid rows with the wrong
+  // column stride, and the full-tile view later consumed by the L1->L0A/
+  // L0B extract reads shuffled data, silently corrupting the mma result.
+  // Emit the destination tile with the buffer's logical tile dims (the
+  // pre-flatten trailing two dims, at least as large as the transferred
+  // slice) so the stored layout always matches the consumer's tile view.
+  // With tile dims == "valid" template dims the helper takes the useTail
+  // path: the trailing actualTailM/N runtime args carry the true transfer
+  // size and TFILLPAD zero-fills the remainder of the tile.
+  if (is_load && op_name == "copy_gm_to_l1") {
+    auto tile_it = buffer_tile_shapes_.find(local_info.var);
+    if (tile_it != buffer_tile_shapes_.end()) {
+      const Array<PrimExpr> &tile_shape = (*tile_it).second;
+      if (tile_shape.size() == 2) {
+        const auto *tile_rows = tile_shape[0].as<IntImmNode>();
+        const auto *tile_cols = tile_shape[1].as<IntImmNode>();
+        // Only override when the transferred extent is compile-time known so
+        // the max() below stays a constant; dynamic-tail copies keep the
+        // established emission.
+        if (tile_rows && tile_cols) {
+          const auto *extent_imm =
+              local_info.access_ptr->args[3].as<IntImmNode>();
+          if (extent_imm) {
+            int32_t tile_row = static_cast<int32_t>(tile_rows->value);
+            int32_t tile_col = static_cast<int32_t>(tile_cols->value);
+            shape4 = std::max(shape4, tile_row);
+            shape5 = std::max(shape5, tile_col);
+          }
+        }
+      }
+    }
+  }
   std::string shape_tmpl =
       "1, 1, 1, " + std::to_string(shape4) + ", " + std::to_string(shape5);
 
@@ -1346,8 +1383,14 @@ void CodeGenTileLangAscendPto::GMCopyCall(const CallNode *call,
              op_name.find("atomic_add_ub_to_gm") != std::string::npos) {
     // Use buffer's full shape for UB tile physical dimensions
     stream << slice_info.row << ", " << slice_info.col;
+  } else if (op_name.rfind("copy_gm_to_l1", 0) == 0) {
+    // The L1 destination tile template must match the tile dims emitted
+    // above (the logical L1 tile, >= the transferred slice) so the helper
+    // takes the useTail path and TFILLPAD zero-fills beyond the transferred
+    // rows/cols.
+    stream << shape4 << ", " << shape5;
   } else {
-    // copy_l0c_to_gm / copy_gm_to_l1 / atomic_add_l0c_to_gm use valid size
+    // copy_l0c_to_gm / atomic_add_l0c_to_gm use valid size
     stream << slice_info.slice_valid_row << ", " << slice_info.slice_valid_col;
     // Add enable_relu template parameter for copy_l0c_to_gm and
     // atomic_add_l0c_to_gm
@@ -4236,6 +4279,9 @@ void CodeGenTileLangAscendPto::AddFunction(const GlobalVar &gvar,
   // PrimExpr>>("tiling_map").value_or(Map<Var, PrimExpr>());
   buffer_shapess_ =
       f->GetAttr<Map<Var, Array<PrimExpr>>>(tvm::tl::kLogicBufferShapes)
+          .value_or(Map<Var, Array<PrimExpr>>());
+  buffer_tile_shapes_ =
+      f->GetAttr<Map<Var, Array<PrimExpr>>>(tvm::tl::kLogicBufferTileShapes)
           .value_or(Map<Var, Array<PrimExpr>>());
   buffer_versions_ = f->GetAttr<Map<Var, PrimExpr>>("buffer_versions")
                          .value_or(Map<Var, PrimExpr>());

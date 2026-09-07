@@ -356,6 +356,8 @@ private:
 
   Map<Var, PrimExpr> address_map_;
   Map<Var, Array<PrimExpr>> buffer_shapess_;
+  // Trailing two dims of each buffer's pre-flatten shape (logical 2D tile).
+  Map<Var, Array<PrimExpr>> buffer_tile_shapes_;
   Map<Var, PrimExpr> buffer_versions_;
   std::unordered_map<const VarNode *, DataType> buffer_dtypes_;
 

@@ -152,9 +152,26 @@ tvm::transform::Pass CreateFlatten2DPass() {
 
     // 3. Merge and compress shapes into the final 2D format
     Map<Var, Array<PrimExpr>> logical_2d_shapes;
+    // Record the trailing two dims of each buffer's *pre-lowering* shape
+    // (kInitialBufferShapes).  For ND >= 2 buffers this is the logical 2D
+    // tile (the leading dims are a grid of such tiles); scope-local L1
+    // buffers are already flattened to 1D by earlier passes, so the current
+    // shape cannot be used.  The PTO codegen uses this map to emit GM->L1
+    // loads whose L1 Mat tile template matches the tile view consumed by
+    // the later L1->L0A/L0B extracts.
+    Map<Var, Array<PrimExpr>> tile_shapes;
     arith::Analyzer analyzer;
     for (const auto &[buffer_var, shape] : collector.GetBufferShapes()) {
       String scope = collector.GetBufferScopes().at(buffer_var);
+
+      Array<PrimExpr> pre_shape = shape;
+      if (initial_shapes.count(buffer_var)) {
+        pre_shape = initial_shapes.at(buffer_var);
+      }
+      if (pre_shape.size() >= 2) {
+        tile_shapes.Set(buffer_var, {pre_shape[pre_shape.size() - 2],
+                                     pre_shape[pre_shape.size() - 1]});
+      }
 
       if (!kScopesToFlatten.count(scope)) {
         logical_2d_shapes.Set(buffer_var, shape);
@@ -213,6 +230,7 @@ tvm::transform::Pass CreateFlatten2DPass() {
     }
 
     final_dict.Set(kLogicBufferShapes, final_layouts);
+    final_dict.Set(kLogicBufferTileShapes, tile_shapes);
 
     return WithAttrs(f, final_dict);
   };
