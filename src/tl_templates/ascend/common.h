@@ -48,8 +48,7 @@ constexpr bool IsDuplicateSupported_v =
 // width, NOT sizeof(): int4b_t has sizeof == 1 but only occupies 4 bits (two
 // elements are nibble-packed into one byte, both in GM and in the on-chip
 // fractal layouts), so any geometry derived from sizeof() is 2x off for int4.
-template <typename T>
-CATLASS_DEVICE constexpr uint32_t ElementSizeBits() {
+template <typename T> CATLASS_DEVICE constexpr uint32_t ElementSizeBits() {
   if constexpr (std::is_same_v<T, int4b_t>) {
     return 4;
   } else {
