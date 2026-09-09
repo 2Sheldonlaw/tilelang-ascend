@@ -124,6 +124,7 @@ requires_torch_int4 = pytest.mark.skipif(
 
 
 @requires_npu
+@requires_torch_int4
 def test_fp16_to_int4_quant_packed():
     M, N = 128, 256
     torch.manual_seed(0)
@@ -150,7 +151,15 @@ def test_fp16_to_int4_quant_packed():
         (64, 64, 64, 64, 64, 64),  # minimal single-fractal shapes
         (128, 256, 128, 128, 256, 128),  # K_L1 = 128: two s4 K blocks per L0B load
         (128, 256, 1024, 128, 256, 128),  # K loop with two-block L0B loads
-        (128, 1024, 256, 128, 256, 64),  # N needs L0B N-tiling inside gemm_v0
+        (128, 1024, 256, 128, 256, 64),  # full-tensor N split across kernel grid
+        # internal gemm_v0 N-tiling: block_N=1024 > int4 nMaxByL0B=512 (with
+        # kL0Size=128) -> nL0split=2, exercises the bNOffset/cNOffset branches
+        (32, 1024, 64, 32, 1024, 64),
+        # internal gemm_v0 K-tiling: K_L1=256 > kL0Size=128 -> kL0split=2,
+        # exercises the kL0Idx L1-offset branches + L0A/L0B ping-pong
+        (128, 256, 256, 128, 256, 256),
+        # both internal tilings at once: nL0split=2 AND kL0split=2
+        (32, 1024, 512, 32, 1024, 256),
     ],
 )
 def test_gemm_v0_int4(M, N, K, block_M, block_N, K_L1):
@@ -171,6 +180,39 @@ def test_gemm_v0_int4(M, N, K, block_M, block_N, K_L1):
     # int4 -> int32 matmul is exact; assert a tight tolerance to catch any
     # layout/packing regression (the original bug mismatched ~99.6% of elements).
     torch.testing.assert_close(c.cpu(), ref_c, rtol=0, atol=0)
+
+
+@requires_npu
+def test_int4_odd_width_rejected():
+    # Odd int4 contiguous dimensions are fundamentally unrepresentable:
+    # nibble packing requires two elements per byte, so an odd row width has
+    # no byte-aligned GM layout and every copy would silently drop the last
+    # element of each row. Must be rejected at compile time with a clear
+    # message instead.
+    @T.prim_func
+    def odd_width_kernel(A: T.Tensor((4, 17), "int4"), B: T.Tensor((4, 17), "int4")):
+        with T.Kernel(1, is_npu=True):
+            a_ub = T.alloc_ub((4, 17), "int4")
+            with T.Scope("V"):
+                T.copy(A[0, 0], a_ub)
+                T.copy(a_ub, B[0, 0])
+
+    with pytest.raises(Exception, match="odd contiguous dimension"):
+        _compile(odd_width_kernel)
+
+
+@requires_npu
+@requires_torch_int4
+def test_gemm_v0_int4_alignment_reject(capfd):
+    # K=96 is a multiple of 16 but not of 64: the s4 load intrinsics and
+    # mad_s4 consume whole 64-element C0 blocks while buffer planning and the
+    # L0A/L0B ping-pong slots use the unrounded sizes, so a 96-wide K-tile
+    # would silently load/accumulate 128 elements over a 96-planned slot.
+    # Must be rejected at C++ compile time (static_assert in gemm_v0).
+    with pytest.raises(Exception):  # noqa: B017
+        _compile(_gemm_v0_int4_kernel(128, 256, 96, 128, 256, 96))
+    captured = capfd.readouterr()
+    assert "multiple of 64" in captured.err
 
 
 @requires_npu
@@ -205,6 +247,7 @@ def test_w4a4_quant_then_matmul():
 
 
 @requires_npu
+@requires_torch_int4
 def test_int4_pto_target_clear_error():
     # The pto backend cannot support int4 yet: pto-isa lacks the s4
     # instructions (mad_s4 / vconv_f162s4), see cann/pto-isa#115. The failure

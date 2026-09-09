@@ -44,22 +44,17 @@ constexpr bool IsDuplicateSupported_v =
     std::is_same_v<T, int32_t> || std::is_same_v<T, uint32_t> ||
     std::is_same_v<T, float>;
 
-namespace detail {
 // Bit width of a single element. Sub-byte types must report their packed bit
 // width, NOT sizeof(): int4b_t has sizeof == 1 but only occupies 4 bits (two
 // elements are nibble-packed into one byte, both in GM and in the on-chip
 // fractal layouts), so any geometry derived from sizeof() is 2x off for int4.
-template <typename T> struct ElementSizeBitsImpl {
-  static constexpr uint32_t value = sizeof(T) * 8;
-};
-template <> struct ElementSizeBitsImpl<int4b_t> {
-  static constexpr uint32_t value = 4;
-};
-} // namespace detail
-
-// Bit width of one element of T (4 for int4b_t).
-template <typename T> CATLASS_DEVICE constexpr uint32_t ElementSizeBits() {
-  return detail::ElementSizeBitsImpl<T>::value;
+template <typename T>
+CATLASS_DEVICE constexpr uint32_t ElementSizeBits() {
+  if constexpr (std::is_same_v<T, int4b_t>) {
+    return 4;
+  } else {
+    return sizeof(T) * 8;
+  }
 }
 
 // Elements of T that fit in one 32-byte C0 block (64 for int4b_t).
@@ -1321,6 +1316,25 @@ gemm_v0(LocalTensor<T1> const &A, LocalTensor<T1> const &B,
   // compile-time; only "how many columns are actually computed" changes (dual
   // to the runtime K already threaded through mma).
   static_assert(kL0Size % 16 == 0, "kL0Size must be a multiple of 16");
+  // int4 (W4A4) fractal alignment: the s4 load intrinsics and mad_s4 consume
+  // K/N in whole 64-element C0 blocks (64 nibbles per 32B block), while the
+  // buffer planning, L0A/L0B ping-pong slot sizes and the zN offset strides
+  // above all use the unrounded template sizes. A K/N/kL0Size that is a
+  // multiple of 16 but not of 64 (e.g. 96) would load/accumulate a rounded-up
+  // 128 elements over a 96-planned slot -- silent garbage or slot overwrite.
+  // Reject at compile time until tail-block zero-fill support (cf. the int8
+  // kL0Tail handling) is added for int4.
+  if constexpr (std::is_same_v<T1, int4b_t>) {
+    static_assert(K % 64 == 0,
+                  "gemm_v0 int4 (W4A4) requires K to be a multiple of 64 "
+                  "(one s4 C0 block; tail blocks are not zero-filled yet)");
+    static_assert(N % 64 == 0,
+                  "gemm_v0 int4 (W4A4) requires N to be a multiple of 64 "
+                  "(one s4 C0 block; tail blocks are not zero-filled yet)");
+    static_assert(kL0Size % 64 == 0,
+                  "gemm_v0 int4 (W4A4) requires kL0Size to be a multiple of "
+                  "64 (one s4 C0 block)");
+  }
   // Elements per C0 block (32 bytes). Equals 16 only for half; for int8 it is
   // 32, for int4b_t it is 64 (two nibbles per byte), for float it is 8. The
   // fractal (zN/zZ/nZ) K-stride used below to step between L0 K-tiles is
