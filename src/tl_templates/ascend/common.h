@@ -253,10 +253,103 @@ CATLASS_DEVICE void
 copy_ub_to_gm(GlobalTensor<T> dstTensor, LocalTensor<T> srcTensor,
               uint32_t realdstN = 1, uint32_t maskShapeM = srcM,
               uint32_t maskShapeN = srcN) {
-  AscendC::DataCopyExtParams dataCopyParams(
-      maskShapeM, maskShapeN * sizeof(T), (srcN - maskShapeN) * sizeof(T) / 32,
-      (realdstN - maskShapeN) * sizeof(T), 0);
-  AscendC::DataCopyPad(dstTensor, srcTensor, dataCopyParams);
+  // MTE3 (UB -> GM) hardware contract (dav-c220 / dav-c310):
+  //  * every burst's GM destination address must be 32B aligned;
+  //  * the UB source address advances ceil(blockLen / 32) + srcStride 32B
+  //    blocks per burst, so a multi-burst copy needs 32B-multiple row pitches
+  //    on both sides (a non-32B blockLen itself is fine, the GM write is
+  //    masked to blockLen bytes - see CopyRemovePad in CANN's detect_mat_mul);
+  //  * a single burst may have an arbitrary byte length.
+  // The previous implementation always used the multi-burst form and silently
+  // corrupted data when the source rows are packed tighter than 32B with more
+  // than one row (e.g. an (M, 1) fp32 keepdim reduce result, issue #1682) or
+  // when the GM destination is not 32B aligned (issue #1304).
+  constexpr uint32_t kBlockBytes = 32;
+  const uint32_t blockLen = maskShapeN * sizeof(T);
+  const uint32_t srcPitch = srcN * sizeof(T);
+  const uint32_t dstPitch = realdstN * sizeof(T);
+  const bool dstAligned =
+      (reinterpret_cast<uint64_t>(dstTensor.GetPhyAddr()) % kBlockBytes) == 0;
+
+  if (blockLen == 0 || maskShapeM == 0) {
+    return;
+  }
+
+  if (srcN == maskShapeN && realdstN == maskShapeN && dstAligned) {
+    // Fully packed on both sides: one flat burst of maskShapeM rows handles
+    // any row width, including widths below 32B.
+    //
+    // bisheng's automatic cross-pipe dependency sync only covers
+    // straight-line intrinsics; once the DataCopyPad sits under a runtime
+    // conditional it is silently dropped, so the burst can overtake a
+    // still-running V (or MTE2) producer of the source UB. Order the producer
+    // pipes explicitly with event id 0 (the tilelang auto-sync pass allocates
+    // 1..7, and the repeated set/wait pattern with a fixed id follows
+    // copy_gm_to_ub and CANN's SoftSyncAllImpl).
+    AscendC::DataCacheCleanAndInvalid<T, AscendC::CacheLine::ENTIRE_DATA_CACHE,
+                                      AscendC::DcciDst::CACHELINE_OUT>(
+        dstTensor);
+    AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(0);
+    AscendC::DataCopyExtParams dataCopyParams(1, maskShapeM * blockLen, 0, 0,
+                                              0);
+    AscendC::DataCopyPad(dstTensor, srcTensor, dataCopyParams);
+    // Order subsequent S-pipe scalar GM stores (e.g. tilelang-lowered
+    // element stores) behind the DMA: a scalar store's cache-line fill could
+    // otherwise race the in-flight MTE3 write and write stale bytes back.
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(0);
+    return;
+  }
+
+  if (dstAligned && maskShapeM <= 4095 &&
+      (maskShapeM == 1 ||
+       (srcPitch % kBlockBytes == 0 && dstPitch % kBlockBytes == 0))) {
+    // Classic multi-burst copy. Non-32B blockLen is fine when the row pitches
+    // are 32B multiples (the hardware rounds each source burst read up to a
+    // whole number of 32B blocks); for a single row the strides are
+    // irrelevant. blockCount is a 12-bit instruction field (max 4095).
+    // See the flat branch above for the explicit producer-pipe sync.
+    AscendC::DataCacheCleanAndInvalid<T, AscendC::CacheLine::ENTIRE_DATA_CACHE,
+                                      AscendC::DcciDst::CACHELINE_OUT>(
+        dstTensor);
+    AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(0);
+    AscendC::DataCopyExtParams dataCopyParams(
+        maskShapeM, blockLen, (srcPitch - blockLen) / kBlockBytes,
+        dstPitch - blockLen, 0);
+    AscendC::DataCopyPad(dstTensor, srcTensor, dataCopyParams);
+    // See the flat branch above: order later scalar GM stores behind the DMA.
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(0);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(0);
+    return;
+  }
+
+  // Fallback: the MTE3 bulk engine cannot service this copy (GM destination
+  // not 32B aligned, packed sub-32B source rows with a strided destination, or
+  // too many rows). Degrade to a scalar element copy so the data still lands
+  // correctly (issue #1304). The scalar reads run on the S pipe, so make
+  // prior V / MTE2 writes to the source visible first (same pattern as
+  // CANN's ReduceSum before a GetValue). Note: the atomic_add_ub_to_gm
+  // wrapper loses DMA atomicity on this cold path.
+  AscendC::SetFlag<AscendC::HardEvent::V_S>(0);
+  AscendC::WaitFlag<AscendC::HardEvent::V_S>(0);
+  AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(0);
+  AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(0);
+  for (uint32_t row = 0; row < maskShapeM; ++row) {
+    for (uint32_t col = 0; col < maskShapeN; ++col) {
+      dstTensor.SetValue(row * realdstN + col,
+                         srcTensor.GetValue(row * srcN + col));
+    }
+  }
 }
 
 template <typename T, uint32_t srcN, uint32_t srcM = 1>
