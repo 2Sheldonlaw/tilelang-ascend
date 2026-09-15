@@ -114,7 +114,7 @@ def _fold_kernel():
     ):
         with T.Kernel(F_G, is_npu=True) as (cid, vid):
             q_ub = T.alloc_ub((F_BM, F_D), DTYPE)
-            T.copy(Q[0, 0:F_BM, 1, cid * F_D:(cid + 1) * F_D], q_ub)
+            T.copy(Q[0, 0:F_BM, 1, cid * F_D : (cid + 1) * F_D], q_ub)
             T.copy(q_ub, O[0, 0:F_BM, cid, 0:F_D])
 
     return fold_middle_scalar
@@ -131,8 +131,7 @@ def _ascendc_copy_strides(source):
     the GM operand's name, not a digit)."""
     strides = []
     for line in source.splitlines():
-        if not any(op in line for op in ("copy_gm_to_ub<", "copy_ub_to_gm<",
-                                         "atomic_add_ub_to_gm<")):
+        if not any(op in line for op in ("copy_gm_to_ub<", "copy_ub_to_gm<", "atomic_add_ub_to_gm<")):
             continue
         match = re.search(r"\], (\d+), ", line)
         assert match is not None, f"no strideN found in copy call: {line.strip()}"
@@ -148,8 +147,8 @@ def test_row_slice_copy_stride_codegen_ascendc():
     # CP gm2ub, C2 gm2ub, C2 ub2gm.
     assert len(strides) == 3, f"expected 3 GM copy calls, got {len(strides)}: {strides}"
     assert strides == [BLOCK_N, BLOCK_N, BLOCK_N], (
-        f"row-slice strideN must be the row width {BLOCK_N}, got {strides} "
-        "(the pre-fix bug returned the whole-buffer size)")
+        f"row-slice strideN must be the row width {BLOCK_N}, got {strides} (the pre-fix bug returned the whole-buffer size)"
+    )
 
 
 def test_row_slice_atomic_add_stride_codegen_ascendc():
@@ -157,8 +156,7 @@ def test_row_slice_atomic_add_stride_codegen_ascendc():
     source = tilelang.lower(_atomic_kernel(), target="ascendc").kernel_source
     strides = _ascendc_copy_strides(source)
     assert len(strides) == 2, f"expected 2 GM calls, got {len(strides)}: {strides}"
-    assert strides == [BLOCK_N, BLOCK_N], (
-        f"row-slice atomic-add strideN must be {BLOCK_N}, got {strides}")
+    assert strides == [BLOCK_N, BLOCK_N], f"row-slice atomic-add strideN must be {BLOCK_N}, got {strides}"
 
 
 def test_fold_middle_scalar_stride_codegen_ascendc():
@@ -170,8 +168,8 @@ def test_fold_middle_scalar_stride_codegen_ascendc():
     # gm2ub folds the scalar N2 dim below the row dim; ub2gm into O folds the
     # G dim of O[1, BM, G, D] the same way.
     assert strides == [F_N2 * F_G * F_D, F_G * F_D], (
-        f"folded strides expected, got {strides} "
-        "(always-return-last-dim would break the multi-row DMA)")
+        f"folded strides expected, got {strides} (always-return-last-dim would break the multi-row DMA)"
+    )
 
 
 @pytest.mark.parametrize("target", ["ascendc", "pto"])
@@ -204,11 +202,9 @@ def test_fold_middle_scalar_stride_codegen(target):
         assert _ascendc_copy_strides(source) == [F_N2 * F_G * F_D, F_G * F_D]
     else:
         # Q merges to (1, BM, N2*G*D): the row-pitch slot holds N2*G*D.
-        assert (f"pto::Stride<1, {F_BM * F_N2 * F_G * F_D}, "
-                f"{F_BM * F_N2 * F_G * F_D}, {F_N2 * F_G * F_D}, 1>") in source
+        assert (f"pto::Stride<1, {F_BM * F_N2 * F_G * F_D}, {F_BM * F_N2 * F_G * F_D}, {F_N2 * F_G * F_D}, 1>") in source
         # O merges to (1, BM, G*D): the row-pitch slot holds G*D.
-        assert (f"pto::Stride<1, {F_BM * F_G * F_D}, "
-                f"{F_BM * F_G * F_D}, {F_G * F_D}, 1>") in source
+        assert (f"pto::Stride<1, {F_BM * F_G * F_D}, {F_BM * F_G * F_D}, {F_G * F_D}, 1>") in source
 
 
 @pytest.mark.skipif(
@@ -219,8 +215,7 @@ def test_fold_middle_scalar_stride_codegen(target):
 def test_row_slice_scatter_add_correctness(target):
     """The issue's kernel: read-modify-write rows of a packed 2D GM buffer
     through 1D UB tiles (out_idx=[] -- in-place buffer mutation)."""
-    func = tilelang.compile(_scatter_kernel(), out_idx=[],
-                            pass_configs=PASS_CONFIGS, target=target)
+    func = tilelang.compile(_scatter_kernel(), out_idx=[], pass_configs=PASS_CONFIGS, target=target)
     torch.manual_seed(0)
     cp = torch.randn(HALF_TILES, BLOCK_M, BLOCK_N, dtype=torch.float32).npu()
     c2 = torch.randn(PACKED_ROWS, BLOCK_N, dtype=torch.float32).npu()
@@ -249,8 +244,7 @@ def test_row_slice_atomic_add_correctness(target):
     cores run each block (the VEC_NUM=2 convention of the tile atomic_add
     tests), so every row is added twice."""
     rows = 16
-    func = tilelang.compile(_atomic_kernel(rows), pass_configs=PASS_CONFIGS,
-                            target=target)
+    func = tilelang.compile(_atomic_kernel(rows), pass_configs=PASS_CONFIGS, target=target)
     torch.manual_seed(0)
     src = torch.randn(rows, BLOCK_N, dtype=torch.float32).npu()
     c2 = torch.zeros(rows, BLOCK_N, dtype=torch.float32).npu()
@@ -269,8 +263,7 @@ def test_row_slice_atomic_add_correctness(target):
 def test_fold_middle_scalar_copy_correctness(target):
     """Multi-row copies whose rows straddle a scalar dim: the folded stride
     (N2*G*D) is what the DMA actually uses between rows."""
-    func = tilelang.compile(_fold_kernel(), out_idx=[-1],
-                            pass_configs=PASS_CONFIGS, target=target)
+    func = tilelang.compile(_fold_kernel(), out_idx=[-1], pass_configs=PASS_CONFIGS, target=target)
     torch.manual_seed(0)
     q = torch.randn(1, F_BM, F_N2, F_G * F_D, dtype=torch.float32).npu()
     torch.npu.synchronize()
