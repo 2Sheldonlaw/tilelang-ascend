@@ -236,8 +236,7 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   // any singleton dims in between); then the leading dims simply multiply
   // the row count -- the "total plane" (d0*d1, d2). Without the fold the
   // leading dims were silently dropped and the DMA copied only the
-  // last-2-dims rectangle, leaving most of the destination uninitialized
-  // (issue #1231).
+  // last-2-dims rectangle, leaving most of the destination uninitialized.
   struct FoldedRegion {
     bool foldable = false;
     // Row count with the outermost dim tail-clamped (runtime expr).
