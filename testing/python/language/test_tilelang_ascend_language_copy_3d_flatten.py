@@ -170,8 +170,7 @@ def test_4d_sliced_copy_must_not_fold():
     # The folded form would carry the flattened row count (16*4 = 64) in the
     # template / maskShapeM; it must be absent.
     assert not any("<float, 8, 64>" in ln for ln in copy_lines), (
-        "4D sliced copy with a shape>1 singleton between row and col dims must not fold: "
-        + copy_lines[0].strip()
+        "4D sliced copy with a shape>1 singleton between row and col dims must not fold: " + copy_lines[0].strip()
     )
 
 
