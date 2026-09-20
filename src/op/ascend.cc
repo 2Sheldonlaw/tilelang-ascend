@@ -231,12 +231,23 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
   // A region with more than two active dims (e.g. a 3D block copy) must be
   // flattened into the 2D (rows x cols) DMA rectangle the copy helpers
-  // model. The flatten is only memory-uniform when every active row dim
-  // except the outermost fully covers the buffer dims it spans (including
-  // any singleton dims in between); then the leading dims simply multiply
-  // the row count -- the "total plane" (d0*d1, d2). Without the fold the
-  // leading dims were silently dropped and the DMA copied only the
-  // last-2-dims rectangle, leaving most of the destination uninitialized.
+  // model. Without the fold the leading dims were silently dropped and the
+  // DMA copied only the last-2-dims rectangle, leaving most of the
+  // destination uninitialized.
+  //
+  // The flatten is guarded by two conditions:
+  //   1. Every active row dim except the outermost fully spans its group
+  //      (dims up to and including the next active dim), so consecutive
+  //      row starts keep a constant pitch.
+  //   2. On the UB side that pitch must equal the last dim. The UB burst
+  //      pitch is not a free parameter: it is derived from the dstN/srcN
+  //      template, which is built from the last-dim extent/shape. A
+  //      singleton dim with shape > 1 between the last row dim and the col
+  //      dim (e.g. shape (T, 4, 2, 8) with region [16, 4, 1, 8]: physical
+  //      row pitch 2*8 = 16, not 8) therefore makes the fold
+  //      unrepresentable -- the DMA would write rows at the wrong offsets.
+  //      The GM side needs no such check: its pitch rides the free strideN
+  //      argument, which already folds those singleton shapes.
   struct FoldedRegion {
     bool foldable = false;
     // Row count with the outermost dim tail-clamped (runtime expr).
@@ -253,7 +264,8 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
           return;
         }
         // Active row dims: active[0 .. m-2] (outermost first), col:
-        // active[m-1]. A uniform burst pitch requires, for each j in [0, m-3]:
+        // active[m-1]. A uniform burst pitch requires, for each j in
+        // [0, m-3]:
         //   extents[active[j+1]] == prod(buf->shape[active[j]+1 ..
         //   active[j+1]])
         // (the intermediate active dim fully spans its group).
@@ -265,6 +277,19 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
             group = group * buf->shape[q];
           }
           if (!analyzer->CanProveEqual(extents[mid], group)) {
+            return;
+          }
+        }
+        // Condition 2 above: on the UB side, the dims between the last row
+        // dim and the col dim must all be physically trivial (shape 1) --
+        // they sit inside the burst pitch, which the last-dim-bound
+        // template cannot widen.
+        if (buf.scope() == "shared.ub") {
+          PrimExpr tail_gap = Integer(1);
+          for (int q = active[active.size() - 2] + 1; q < active.back(); ++q) {
+            tail_gap = tail_gap * buf->shape[q];
+          }
+          if (!analyzer->CanProveEqual(tail_gap, 1)) {
             return;
           }
         }
@@ -288,6 +313,13 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   FoldedRegion src_fold, dst_fold;
   fold_leading_row_dims(src, src_range, src_extents, src_active, src_fold);
   fold_leading_row_dims(dst, dst_range, dst_extents, dst_active, dst_fold);
+  // The fold commits the DMA to the flattened row count on BOTH sides, so
+  // it is all-or-nothing: only fold when each side's region folds (the GM
+  // side supplies uniformly pitched rows via strideN; the UB side must
+  // additionally be tail-gap free). A mismatch -- e.g. a clean GM region
+  // landing in a differently shaped UB buffer -- falls back to the
+  // unfolded 2D form instead of half-folding.
+  bool fold_copy = src_fold.foldable && dst_fold.foldable;
 
   struct CopyConfig {
     bool needs_strideN = false;
@@ -363,7 +395,7 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         // default maskShapeM) is the folded row product, not the buffer's
         // second-to-last dim. Fall back to the 2D blocklen when the product
         // is not a compile-time constant.
-        if (dst_fold.foldable && dst_fold.full_rows->IsInstance<IntImmNode>()) {
+        if (fold_copy && dst_fold.full_rows->IsInstance<IntImmNode>()) {
           ss << ", " << dst_fold.full_rows;
         } else {
           ss << ", " << compute_blocklen(dst, dst_extents);
@@ -395,7 +427,7 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         // row product as the template row count. (srcM is only the default
         // for the explicitly-passed maskShapeM, so this stays cosmetic for
         // full copies.)
-        if (src_fold.foldable && src_fold.full_rows->IsInstance<IntImmNode>()) {
+        if (fold_copy && src_fold.full_rows->IsInstance<IntImmNode>()) {
           ss << ", " << src_fold.full_rows;
         } else {
           ss << ", " << compute_blocklen(src, src_extents);
@@ -539,7 +571,8 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
                              src_range[col_idx]->extent, src->shape[col_idx]);
     // Fold the leading active dims into the row count (see
     // fold_leading_row_dims); valid_rows already includes the row_idx dim.
-    if (src_fold.foldable) {
+    // Gated on fold_copy: both sides must fold, see the comment there.
+    if (fold_copy) {
       validRow_src = src_fold.valid_rows;
     }
   } else if (src_active.size() == 1) {
@@ -565,7 +598,8 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
                              dst_range[col_idx]->extent, dst->shape[col_idx]);
     // Fold the leading active dims into the row count (see
     // fold_leading_row_dims); valid_rows already includes the row_idx dim.
-    if (dst_fold.foldable) {
+    // Gated on fold_copy: both sides must fold, see the comment there.
+    if (fold_copy) {
       validRow_dst = dst_fold.valid_rows;
     }
   } else if (dst_active.size() == 1) {
@@ -650,7 +684,7 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     // flattened (prod(leading dims), last dim) plane; report that so the
     // tail-mask model stays consistent with the folded validRow.
     if (dst->shape.size() > 1) {
-      if (dst_fold.foldable) {
+      if (fold_copy) {
         PrimExpr phys_rows = Integer(1);
         for (size_t i = 0; i + 1 < dst->shape.size(); ++i) {
           phys_rows = phys_rows * dst->shape[i];
@@ -670,7 +704,7 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     // physical row count so AscendTailMaskPropagation's output hints stay
     // consistent with the folded validRow.
     if (src->shape.size() > 1) {
-      if (src_fold.foldable) {
+      if (fold_copy) {
         PrimExpr phys_rows = Integer(1);
         for (size_t i = 0; i + 1 < src->shape.size(); ++i) {
           phys_rows = phys_rows * src->shape[i];

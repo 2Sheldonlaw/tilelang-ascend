@@ -124,5 +124,108 @@ def test_4d_copy_full_blocks():
     run_test_nd_copy_roundtrip((2, 8, 4, 8), "float", num_tokens_list=[8])
 
 
+def gm_ub_gm_4d_sliced_copy(ub_tail_shape, dtype):
+    """4D copy with a singleton dim between the row dim and the col dim.
+
+    GM buffer (num_tokens, 4, 2, 8); the region fixes dim2 to one element
+    ([t:t+16, 0:4, 0:1, 0:8]), so the physical row pitch is 2*8 = 16, not 8.
+    ``ub_tail_shape`` is the UB tile's trailing shape: (4, 2, 8) mirrors the
+    GM buffer (the reviewer's counterexample -- unrepresentable on the UB
+    side, must NOT fold), while (4, 1, 8) squeezes the singleton dim (the
+    pitch is 8 there, and the GM-side gap rides the free strideN arg, so
+    the fold is legal and must stay enabled).
+    """
+    num_tokens = T.symbolic("num_tokens")
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((num_tokens, 4, 2, 8), dtype),
+        C: T.Tensor((num_tokens, 4, 2, 8), dtype),
+    ):
+        with T.Kernel(T.ceildiv(num_tokens, 16), is_npu=True) as (cid, vid):
+            a_ub = T.alloc_ub((16,) + tuple(ub_tail_shape), dtype)
+            row_base = cid * 16
+            T.copy(A[row_base : row_base + 16, 0:4, 0:1, 0:8], a_ub[:, 0:4, 0:1, 0:8])
+            T.copy(a_ub[:, 0:4, 0:1, 0:8], C[row_base : row_base + 16, 0:4, 0:1, 0:8])
+
+    return main
+
+
+def test_4d_sliced_copy_must_not_fold():
+    """A singleton dim with shape > 1 between the last row dim and the col
+    dim makes the fold unrepresentable on the UB side: the physical row
+    pitch is 16 while the dstN template (last-dim bound) can only express 8.
+    The lowering must reject the fold and keep the pre-existing unfolded 2D
+    form -- folding here would scatter rows across wrong UB offsets."""
+    torch.manual_seed(0)
+    tilelang.disable_cache()
+    try:
+        func = gm_ub_gm_4d_sliced_copy((4, 2, 8), "float")
+        func = tilelang.compile(func, out_idx=[-1], pass_configs=VEC_PASS_CONFIGS, target=TARGET)
+    finally:
+        tilelang.enable_cache()
+    src = func.get_kernel_source()
+    copy_lines = [ln for ln in src.splitlines() if "copy_gm_to_ub" in ln or "copy_ub_to_gm" in ln]
+    assert copy_lines, "expected copy calls in the generated source"
+    # The folded form would carry the flattened row count (16*4 = 64) in the
+    # template / maskShapeM; it must be absent.
+    assert not any("<float, 8, 64>" in ln for ln in copy_lines), (
+        "4D sliced copy with a shape>1 singleton between row and col dims must not fold: "
+        + copy_lines[0].strip()
+    )
+
+
+def test_4d_sliced_copy_gm_gap_ub_clean_roundtrip():
+    """Same sliced region, but the UB tile squeezes the singleton dim
+    ((16, 4, 1, 8)): the UB row pitch is 8, matching the last-dim template,
+    while the GM-side 16 pitch rides the free strideN argument. The fold is
+    legal and the sliced block must round-trip exactly."""
+    torch.manual_seed(0)
+    tilelang.disable_cache()
+    try:
+        func = gm_ub_gm_4d_sliced_copy((4, 1, 8), "float")
+        func = tilelang.compile(func, out_idx=[-1], pass_configs=VEC_PASS_CONFIGS, target=TARGET)
+    finally:
+        tilelang.enable_cache()
+    for num_tokens in [64, 100]:
+        a = torch.randn(num_tokens, 4, 2, 8, dtype=torch.float32).npu()
+        torch.npu.synchronize()
+        c = func(a)
+        torch.npu.synchronize()
+        # Only the s=0 sub-row of each (t, h) is round-tripped.
+        torch.testing.assert_close(c[:, :, 0:1, :].cpu(), a[:, :, 0:1, :].cpu(), rtol=1e-2, atol=1e-2)
+
+
+def test_4d_contiguous_full_block_roundtrip():
+    """A contiguous 4D full block (no singleton gap) must keep folding: (16,
+    4, 2, 8) flattens to a (128, 8) plane. Guards against over-correcting
+    the sliced rejection above."""
+    torch.manual_seed(0)
+    num_tokens = T.symbolic("num_tokens")
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((num_tokens, 4, 2, 8), "float"),
+        C: T.Tensor((num_tokens, 4, 2, 8), "float"),
+    ):
+        with T.Kernel(T.ceildiv(num_tokens, 16), is_npu=True) as (cid, vid):
+            a_ub = T.alloc_ub((16, 4, 2, 8), "float")
+            row_base = cid * 16
+            T.copy(A[row_base : row_base + 16, :, :, :], a_ub[:, :, :, :])
+            T.copy(a_ub[:, :, :, :], C[row_base : row_base + 16, :, :, :])
+
+    tilelang.disable_cache()
+    try:
+        func = tilelang.compile(main, out_idx=[-1], pass_configs=VEC_PASS_CONFIGS, target=TARGET)
+    finally:
+        tilelang.enable_cache()
+    for num_tokens in [64, 100]:
+        a = torch.randn(num_tokens, 4, 2, 8, dtype=torch.float32).npu()
+        torch.npu.synchronize()
+        c = func(a)
+        torch.npu.synchronize()
+        torch.testing.assert_close(c.cpu(), a.cpu(), rtol=1e-2, atol=1e-2)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
