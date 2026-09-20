@@ -16,23 +16,36 @@ two active dims of the region only: a 3D region (16, 4, 8) was flattened to
 elements (token 0) and left the other 15 tokens of the UB tile uninitialized
 -- silent data corruption for any 3D block copy.
 
-The fix: when the region is memory-uniform (every active row dim except the
-outermost fully covers the buffer dims it spans -- e.g. ``A[t:t+16, :, :]`` on
-a ``(T, 4, 8)`` tensor), the leading dims fold into the row count, giving the
-"total plane" (64, 8): the DMA copies ``prod(leading extents)`` bursts of the
-last-dim width, and the tail-block clamp is applied to the outermost dim
-before folding.
+The fix folds the leading dims into the row count (the "total plane", e.g.
+(16, 4, 8) -> (64, 8)) under three guards:
+
+1. Memory uniformity: every active row dim except the outermost fully covers
+   the buffer dims it spans (e.g. ``A[t:t+16, :, :]`` on ``(T, 4, 8)``), so
+   consecutive row starts keep a constant pitch. The tail-block clamp is
+   applied to the outermost dim before folding.
+2. UB-side tail-gap freedom: on the UB side, the dims between the last row
+   dim and the col dim must all have shape 1. The UB burst pitch is bound to
+   the last-dim template (dstN/srcN), so a singleton dim with shape > 1
+   there (e.g. shape ``(T, 4, 2, 8)`` with region ``[16, 4, 1, 8]``:
+   physical row pitch 2*8 = 16) makes the fold unrepresentable and must be
+   rejected. The GM side needs no such check -- its pitch rides the free
+   strideN argument.
+3. Both sides must fold: the fold commits the DMA to the flattened row count
+   on both sides, so it is all-or-nothing; a mismatch (a clean GM region
+   landing in a differently shaped UB buffer) falls back to the unfolded 2D
+   form.
 
 How this test triggers it
 -------------------------
-Round-trips a 3D (and 4D) block through UB: ``T.copy(A[t:t+BT, :, :], ub)``
-followed by ``T.copy(ub, C[t:t+BT, :, :])``. Both the gm2ub load (UB is the
-destination) and the ub2gm store (UB is the source) exercise the fold. Sizes
-are chosen so the last dim is 32B-aligned for float32 (pad = 8) and float16
-(pad = 16). ``num_tokens`` is used both divisible (full blocks) and
-non-divisible (tail blocks, runtime clamp on the outermost dim) by the block
-size. Before the fix every token except the first of each block is garbage;
-after it, the full block round-trips exactly.
+Full-block round-trips (``T.copy(A[t:t+BT, :, :], ub)`` and back) cover the
+fold for 3D and 4D blocks, with ``num_tokens`` both divisible (full blocks)
+and non-divisible (tail blocks, runtime clamp on the outermost dim) by the
+block size. The 4D sliced cases pin guard 2: ``[t:t+16, 0:4, 0:1, 0:8]`` on
+``(T, 4, 2, 8)`` must NOT fold when the UB tile mirrors the GM buffer (the
+reviewer's counterexample -- a folded DMA would scatter rows across wrong UB
+offsets), but must still fold and round-trip exactly when the UB tile
+squeezes the singleton dim (``(16, 4, 1, 8)``, GM pitch via strideN). A
+contiguous 4D full block keeps folding as the over-correction guard.
 
 This targets the ascendc backend only (the fix is in the non-PTO copy
 lowering; the PTO codegen consumes the same validRow/validCol args).
