@@ -1773,7 +1773,14 @@ private:
   }
 
   int AllocateEventId() {
-    event_id_counter_ = (event_id_counter_ + 1) % 8;
+    // Cycle 1..7 and reserve id 0 for the C++ templates: copy_gm_to_ub in
+    // tl_templates/ascend/common.h hard-codes event id 0 for its pad-fill
+    // set/wait pairs (MTE2_V / MTE3_V / V_MTE2). The old
+    // (counter + 1) % 8 wrapped to 0 on every 8th sync; when such a
+    // pass-emitted id-0 pair shares its pipe pair with a template-emitted
+    // one, two SetFlags collapse into a single event bit and the second
+    // WaitFlag blocks forever, deadlocking the queue on device.
+    event_id_counter_ = event_id_counter_ % 7 + 1;
     return event_id_counter_;
   }
 
