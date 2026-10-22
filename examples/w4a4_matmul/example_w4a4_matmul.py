@@ -18,8 +18,13 @@ import torch_npu
 #     nibble = even element, high nibble = odd element); row r of an (M, N)
 #     tensor starts at byte r * N / 2. The quant kernel below produces this
 #     packing directly on device, so the whole chain stays on NPU.
+#   - Uses the combineCV pass (auto sync): core assignment (cube/vector) and
+#     all synchronization are generated automatically -- no manual T.Scope /
+#     T.barrier_all needed.
 
 pass_configs = {
+    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
+    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_SYNC: True,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
 }
@@ -42,10 +47,9 @@ def float16_to_int4_quant(M, N, block_M, block_N):
             a_ub = T.alloc_ub((block_M, block_N), "float16")
             q_ub = T.alloc_ub((block_M, block_N), "int4")
 
-            with T.Scope("V"):
-                T.copy(A[bx * block_M, by * block_N], a_ub)
-                T.tile.cast(q_ub, a_ub, mode="CAST_RINT", count=block_M * block_N)
-                T.copy(q_ub, B[bx * block_M, by * block_N])
+            T.copy(A[bx * block_M, by * block_N], a_ub)
+            T.tile.cast(q_ub, a_ub, mode="CAST_RINT", count=block_M * block_N)
+            T.copy(q_ub, B[bx * block_M, by * block_N])
 
     return main
 
@@ -69,17 +73,13 @@ def w4a4_matmul(M, N, K, block_M, block_N, block_K):
             B_L1 = T.alloc_L1((block_K, block_N), "int4")
             C_L0 = T.alloc_L0C((block_M, block_N), "int32")
 
-            with T.Scope("C"):
-                loop_k = T.ceildiv(K, block_K)
-                for k in T.serial(loop_k):
-                    T.copy(A[bx * block_M, k * block_K], A_L1)
-                    T.barrier_all()
-                    T.copy(B[k * block_K, by * block_N], B_L1)
-                    T.barrier_all()
-                    T.gemm_v0(A_L1, B_L1, C_L0, init=(k == 0))
-                    T.barrier_all()
+            loop_k = T.ceildiv(K, block_K)
+            for k in T.serial(loop_k):
+                T.copy(A[bx * block_M, k * block_K], A_L1)
+                T.copy(B[k * block_K, by * block_N], B_L1)
+                T.gemm_v0(A_L1, B_L1, C_L0, init=(k == 0))
 
-                T.copy(C_L0, C[bx * block_M, by * block_N])
+            T.copy(C_L0, C[bx * block_M, by * block_N])
 
     return main
 
