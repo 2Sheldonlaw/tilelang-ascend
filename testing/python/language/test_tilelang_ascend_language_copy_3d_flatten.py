@@ -19,10 +19,16 @@ elements (token 0) and left the other 15 tokens of the UB tile uninitialized
 The fix folds the leading dims into the row count (the "total plane", e.g.
 (16, 4, 8) -> (64, 8)) under three guards:
 
-1. Memory uniformity: every active row dim except the outermost fully covers
-   the buffer dims it spans (e.g. ``A[t:t+16, :, :]`` on ``(T, 4, 8)``), so
-   consecutive row starts keep a constant pitch. The tail-block clamp is
-   applied to the outermost dim before folding.
+1. Memory uniformity: every active row dim except the outermost fully AND
+   legally covers the buffer dims it spans (e.g. ``A[t:t+16, :, :]`` on
+   ``(T, 4, 8)``) -- its extent equals the group span AND its range starts
+   at the group base (min == 0), so consecutive row starts keep a constant
+   pitch and the flattened plane is the contiguous group span. The
+   min check rejects a shifted slice whose extent still equals the full
+   span (``A[t:t+16, 1:5, :]`` over a size-4 dim, an out-of-bounds region):
+   extent-only checking folded that into a contiguous DMA whose bursts
+   walked across the neighboring tokens and past the end of the buffer.
+   The tail-block clamp is applied to the outermost dim before folding.
 2. UB-side tail-gap freedom: on the UB side, the dims between the last row
    dim and the col dim must all have shape 1. The UB burst pitch is bound to
    the last-dim template (dstN/srcN), so a singleton dim with shape > 1
@@ -237,6 +243,54 @@ def test_4d_contiguous_full_block_roundtrip():
         c = func(a)
         torch.npu.synchronize()
         torch.testing.assert_close(c.cpu(), a.cpu(), rtol=1e-2, atol=1e-2)
+
+
+def gm_ub_gm_3d_mid_offset_copy(dtype):
+    """3D copy whose middle dim slice starts off the group base.
+
+    GM buffer (num_tokens, 4, 8); the region slices the middle (head) dim as
+    [1:5] -- extent 4 == shape 4, but min is 1, an out-of-bounds region.
+    The extent-only uniformity check used to fold it into a 64-row
+    contiguous DMA: each token's bursts crossed the head boundary into the
+    next token and the final burst read 32 bytes past the end of the buffer
+    (the reviewer's counterexample). The fold must be rejected and the
+    copy fall back to the unfolded 2D form."""
+    num_tokens = T.symbolic("num_tokens")
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((num_tokens, 4, 8), dtype),
+        C: T.Tensor((num_tokens, 4, 8), dtype),
+    ):
+        with T.Kernel(T.ceildiv(num_tokens, 16), is_npu=True) as (cid, vid):
+            a_ub = T.alloc_ub((16, 4, 8), dtype)
+            row_base = cid * 16
+            T.copy(A[row_base : row_base + 16, 1:5, :], a_ub[:, 1:5, :])
+            T.copy(a_ub[:, 1:5, :], C[row_base : row_base + 16, 1:5, :])
+
+    return main
+
+
+def test_3d_mid_dim_offset_must_not_fold():
+    """A middle-dim slice with min != 0 whose extent still equals the full
+    span must not fold: the flattened DMA would read across the token
+    boundary and past the end of the buffer. The lowering must reject the
+    fold and keep the pre-existing unfolded 2D form."""
+    torch.manual_seed(0)
+    tilelang.disable_cache()
+    try:
+        func = gm_ub_gm_3d_mid_offset_copy("float")
+        func = tilelang.compile(func, out_idx=[-1], pass_configs=VEC_PASS_CONFIGS, target=TARGET)
+    finally:
+        tilelang.enable_cache()
+    src = func.get_kernel_source()
+    copy_lines = [ln for ln in src.splitlines() if "copy_gm_to_ub" in ln or "copy_ub_to_gm" in ln]
+    assert copy_lines, "expected copy calls in the generated source"
+    # The folded form would carry the flattened row count (16*4 = 64) in the
+    # template / maskShapeM; it must be absent.
+    assert not any("<float, 8, 64>" in ln for ln in copy_lines), (
+        "3D copy with a middle-dim slice that starts off the group base (min != 0) must not fold: " + copy_lines[0].strip()
+    )
 
 
 if __name__ == "__main__":

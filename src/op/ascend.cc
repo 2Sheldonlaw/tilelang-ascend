@@ -235,10 +235,16 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   // DMA copied only the last-2-dims rectangle, leaving most of the
   // destination uninitialized.
   //
-  // The flatten is guarded by two conditions:
-  //   1. Every active row dim except the outermost fully spans its group
-  //      (dims up to and including the next active dim), so consecutive
-  //      row starts keep a constant pitch.
+  // The flatten is guarded by conditions on the intermediate (row) dims:
+  //   1. Every active row dim except the outermost fully AND legally spans
+  //      its group (dims up to and including the next active dim): its
+  //      extent equals the group span AND its range starts at the group
+  //      base (min == 0), so consecutive row starts keep a constant pitch
+  //      and the flattened plane is contiguous. The min check matters for
+  //      out-of-bounds regions whose extent still equals the full span
+  //      (e.g. A[0:16, 1:5, :] over a size-4 dim): extent-only checking
+  //      would fold that into a single contiguous DMA whose bursts walk
+  //      across the neighboring groups and past the end of the buffer.
   //   2. On the UB side that pitch must equal the last dim. The UB burst
   //      pitch is not a free parameter: it is derived from the dstN/srcN
   //      template, which is built from the last-dim extent/shape. A
@@ -268,7 +274,10 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         // [0, m-3]:
         //   extents[active[j+1]] == prod(buf->shape[active[j]+1 ..
         //   active[j+1]])
-        // (the intermediate active dim fully spans its group).
+        // (the intermediate active dim fully spans its group), and every
+        // dim inside the group must start at its base (min == 0) so the
+        // folded plane is the contiguous group span and not a shifted
+        // window over it.
         for (size_t j = 0; j + 2 < active.size(); ++j) {
           int lead = active[j];
           int mid = active[j + 1];
@@ -278,6 +287,11 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
           }
           if (!analyzer->CanProveEqual(extents[mid], group)) {
             return;
+          }
+          for (int q = lead + 1; q <= mid; ++q) {
+            if (!analyzer->CanProveEqual(ranges[q]->min, 0)) {
+              return;
+            }
           }
         }
         // Condition 2 above: on the UB side, the dims between the last row
