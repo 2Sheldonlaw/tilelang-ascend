@@ -17,7 +17,7 @@ elements (token 0) and left the other 15 tokens of the UB tile uninitialized
 -- silent data corruption for any 3D block copy.
 
 The fix folds the leading dims into the row count (the "total plane", e.g.
-(16, 4, 8) -> (64, 8)) under three guards:
+(16, 4, 8) -> (64, 8)) under four guards:
 
 1. Memory uniformity: every active row dim except the outermost fully AND
    legally covers the buffer dims it spans (e.g. ``A[t:t+16, :, :]`` on
@@ -40,6 +40,13 @@ The fix folds the leading dims into the row count (the "total plane", e.g.
    on both sides, so it is all-or-nothing; a mismatch (a clean GM region
    landing in a differently shaped UB buffer) falls back to the unfolded 2D
    form.
+4. DMA row-count limit: ``DataCopyExtParams.blockCount`` is a 12-bit
+   hardware field (at most 4095 bursts per ``DataCopyPad``), but a folded
+   region can easily exceed it -- a (64, 64, 8) float32 block is only
+   128 KiB of UB yet folds to 4096 rows. The copy helpers therefore split
+   the transfer into batches of at most 4095 rows
+   (``MAX_DMA_ROWS`` in src/tl_templates/ascend/common.h), advancing the
+   src/dst tensors by the per-batch element offset.
 
 How this test triggers it
 -------------------------
@@ -291,6 +298,33 @@ def test_3d_mid_dim_offset_must_not_fold():
     assert not any("<float, 8, 64>" in ln for ln in copy_lines), (
         "3D copy with a middle-dim slice that starts off the group base (min != 0) must not fold: " + copy_lines[0].strip()
     )
+
+
+@pytest.mark.parametrize(
+    "block_shape, dtype, num_tokens_list",
+    [
+        # (455, 9, 8): 455*9 = 4095 folded rows -- exactly the
+        # DataCopyExtParams.blockCount limit, still a single batch.
+        ((455, 9, 8), "float", [455, 500]),
+        # (64, 64, 8): 64*64 = 4096 folded rows -- one row past the limit
+        # (the reviewer's counterexample, 128 KiB of UB), split into
+        # 4095 + 1.
+        ((64, 64, 8), "float", [128, 100]),
+        # (65, 64, 16) fp16: 4160 folded rows, split into 4095 + 65; the
+        # tail block of num_tokens=194 keeps 64 tokens -> 4096 rows, so
+        # both the full and the tail block take the multi-batch path. 16
+        # fp16 cols make 32B rows (the memory planner models unaligned
+        # fp16 rows at double footprint, which is a pre-existing quirk
+        # this shape avoids).
+        ((65, 64, 16), "float16", [130, 194]),
+    ],
+)
+def test_3d_copy_folded_rows_beyond_dma_limit_roundtrip(block_shape, dtype, num_tokens_list):
+    """A folded row count above the single-DMA blockCount limit (4095) must
+    still copy every element: the helpers batch the transfer, and both the
+    full blocks (row count above the limit) and tail blocks (runtime clamp
+    below it) must round-trip exactly."""
+    run_test_nd_copy_roundtrip(block_shape, dtype, num_tokens_list)
 
 
 if __name__ == "__main__":

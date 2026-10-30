@@ -231,6 +231,16 @@ CATLASS_DEVICE auto thread_block_swizzle(uint64_t pid) {
   return coord.m() * cols + coord.n();
 }
 
+// DataCopyExtParams.blockCount (the number of DMA bursts) is a 12-bit
+// hardware field: at most 4095 rows fit in a single DataCopyPad (CANN
+// parameter constraint). A folded >2D region flattens its leading dims into
+// the row count (e.g. a (64, 64, 8) float32 block -- only 128 KiB of UB --
+// folds to 4096 rows), and plain 2D tiles can be taller than that too, so
+// the transfer is split into batches of at most MAX_DMA_ROWS with the
+// src/dst tensors advanced by the per-batch element offset (rows * row
+// pitch) between batches.
+constexpr uint32_t MAX_DMA_ROWS = 4095;
+
 template <typename T, uint32_t dstN, uint32_t dstM = 1>
 CATLASS_DEVICE void
 copy_gm_to_ub(LocalTensor<T> dstTensor, GlobalTensor<T> srcTensor,
@@ -260,11 +270,24 @@ copy_gm_to_ub(LocalTensor<T> dstTensor, GlobalTensor<T> srcTensor,
       WaitFlag<HardEvent::V_MTE2>(0);
     }
   }
-  AscendC::DataCopyExtParams dataCopyParams(
-      maskShapeM, maskShapeN * sizeof(T), (realSrcN - maskShapeN) * sizeof(T),
-      (dstN - maskShapeN) * sizeof(T) / 32, 0);
   AscendC::DataCopyPadExtParams<T> padParams(isPad, 0, rightPadding, padValue);
-  AscendC::DataCopyPad(dstTensor, srcTensor, dataCopyParams, padParams);
+  // Batched DMA (see MAX_DMA_ROWS): the pad above covers the whole tile
+  // once, then each batch copies one row chunk. The UB side advances by
+  // dstN elements per row, the GM side by realSrcN.
+  uint32_t remaining = maskShapeM;
+  uint32_t dstOffset = 0;
+  uint64_t srcOffset = 0;
+  while (remaining > 0) {
+    uint32_t rows = remaining > MAX_DMA_ROWS ? MAX_DMA_ROWS : remaining;
+    AscendC::DataCopyExtParams dataCopyParams(
+        rows, maskShapeN * sizeof(T), (realSrcN - maskShapeN) * sizeof(T),
+        (dstN - maskShapeN) * sizeof(T) / 32, 0);
+    AscendC::DataCopyPad(dstTensor[dstOffset], srcTensor[srcOffset],
+                         dataCopyParams, padParams);
+    dstOffset += rows * dstN;
+    srcOffset += static_cast<uint64_t>(rows) * realSrcN;
+    remaining -= rows;
+  }
 }
 
 template <typename T, uint32_t srcN, uint32_t srcM = 1>
@@ -272,10 +295,22 @@ CATLASS_DEVICE void
 copy_ub_to_gm(GlobalTensor<T> dstTensor, LocalTensor<T> srcTensor,
               uint32_t realdstN = 1, uint32_t maskShapeM = srcM,
               uint32_t maskShapeN = srcN) {
-  AscendC::DataCopyExtParams dataCopyParams(
-      maskShapeM, maskShapeN * sizeof(T), (srcN - maskShapeN) * sizeof(T) / 32,
-      (realdstN - maskShapeN) * sizeof(T), 0);
-  AscendC::DataCopyPad(dstTensor, srcTensor, dataCopyParams);
+  // Batched DMA (see MAX_DMA_ROWS): the UB side advances by srcN elements
+  // per row, the GM side by realdstN.
+  uint32_t remaining = maskShapeM;
+  uint32_t srcOffset = 0;
+  uint64_t dstOffset = 0;
+  while (remaining > 0) {
+    uint32_t rows = remaining > MAX_DMA_ROWS ? MAX_DMA_ROWS : remaining;
+    AscendC::DataCopyExtParams dataCopyParams(
+        rows, maskShapeN * sizeof(T), (srcN - maskShapeN) * sizeof(T) / 32,
+        (realdstN - maskShapeN) * sizeof(T), 0);
+    AscendC::DataCopyPad(dstTensor[dstOffset], srcTensor[srcOffset],
+                         dataCopyParams);
+    srcOffset += rows * srcN;
+    dstOffset += static_cast<uint64_t>(rows) * realdstN;
+    remaining -= rows;
+  }
 }
 
 template <typename T, uint32_t srcN, uint32_t srcM = 1>
