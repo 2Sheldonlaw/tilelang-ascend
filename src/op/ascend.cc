@@ -450,6 +450,30 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
                "buffer shape must be a compile-time constant, but got "
             << ub2gm_tmpl_n;
       }
+      // A folded >2D out-copy is by construction a whole-block DMA tile, so
+      // the UB source was loaded by copy_gm_to_ub and its rows sit on the
+      // MTE 32B-slot layout, not the compact pitch the helper's flat form
+      // (upstream #1795) assumes: reading such a tile as one contiguous
+      // slab mixes the slot padding into the data (a fp16 (16, 4, 8) block
+      // round-trips with only row 0 intact). Widen the template col dim to
+      // the 32B-aligned physical pitch in that case: srcN != maskShapeN
+      // then breaks the helper's packed test and routes the copy to the
+      // classic multi-burst, whose slot stepping matches the loading DMA.
+      // The emitted DMA is byte-identical to the unfolded multi-burst
+      // (srcStride stays 0), and 32B-multiple rows are a no-op, so only
+      // sub-32B-row folded copies change behavior. Unfolded copies are
+      // left to the helper's own packed heuristic: their source may be
+      // V-pipe compact (the #1682 family the flat form exists for), which
+      // the lowering cannot distinguish from MTE-slot here.
+      if (fold_copy) {
+        auto *n_imm = ub2gm_tmpl_n.as<IntImmNode>();
+        int bits = src->dtype.bits();
+        int64_t width_bits = n_imm->value * bits;
+        if (width_bits % 256 != 0) {
+          int64_t padded_bits = (width_bits + 255) / 256 * 256;
+          ub2gm_tmpl_n = Integer(padded_bits / bits);
+        }
+      }
       ss << ub2gm_tmpl_n;
       if (src->shape.size() > 1) {
         // See copy_gm_to_ub above: a folded >2D region uses the flattened
