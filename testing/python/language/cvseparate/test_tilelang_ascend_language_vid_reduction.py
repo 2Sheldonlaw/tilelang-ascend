@@ -486,9 +486,7 @@ def tile_range_row_temp_cast(M, N, block_M, block_N):
 @pytest.mark.parametrize("target", ["ascendc", pytest.param("pto", marks=pytest.mark.low_priority)])
 def test_vid_reduction_tile_range_row_temp_cast(setup_random_seed, target):
     M, N, block_M, block_N = 256, 128, 64, 128
-    func = tilelang.compile(
-        tile_range_row_temp_cast(M, N, block_M, block_N), out_idx=[1], pass_configs=pass_configs, target=target
-    )
+    func = tilelang.compile(tile_range_row_temp_cast(M, N, block_M, block_N), out_idx=[1], pass_configs=pass_configs, target=target)
     a = torch.randn(M, N, dtype=torch.float16).npu()
     torch.npu.synchronize()
     b = func(a)
@@ -518,9 +516,7 @@ def tile_range_row_temp_relu(M, N, block_M, block_N):
 @pytest.mark.parametrize("target", ["ascendc", pytest.param("pto", marks=pytest.mark.low_priority)])
 def test_vid_reduction_tile_range_row_temp_relu(setup_random_seed, target):
     M, N, block_M, block_N = 256, 128, 64, 128
-    func = tilelang.compile(
-        tile_range_row_temp_relu(M, N, block_M, block_N), out_idx=[1], pass_configs=pass_configs, target=target
-    )
+    func = tilelang.compile(tile_range_row_temp_relu(M, N, block_M, block_N), out_idx=[1], pass_configs=pass_configs, target=target)
     a = torch.randn(M, N, dtype=torch.float16).npu()
     torch.npu.synchronize()
     b = func(a)
