@@ -1,7 +1,7 @@
 # Copyright (c) Tile-AI Organization.
 # Licensed under the MIT License.
 """Regression tests for the symbolic shape-resolution cache in the cython JIT
-wrapper (issue #1898).
+wrapper.
 
 The wrapper caches resolved output/workspace shapes keyed by the tuple of
 symbolic variable values, so that repeated calls of the same kernel with
@@ -135,8 +135,8 @@ def test_repeated_shape_returns_independent_outputs(symbolic_func):
 
 
 def test_cache_is_populated_per_distinct_shape(symbolic_func):
-    """The #1898 fix itself: after the calls above (module-scope fixture), the
-    wrapper's shape cache must hold exactly one entry per distinct shape."""
+    """The cache itself, not just correct output: the wrapper's shape cache
+    must hold exactly one entry per distinct shape."""
     order = [SHAPES[0], SHAPES[1], SHAPES[0], SHAPES[2], SHAPES[1], SHAPES[0]]
     for M, N in order:
         a, b = _make_inputs(M, N)

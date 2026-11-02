@@ -29,7 +29,7 @@ cdef class CythonKernelWrapper:
         list param_dtypes    # Cache for parameter dtypes
         list param_shapes    # Cache for parameter shapes as native Python lists
         object get_current_device
-    # Exposed read-only for introspection/testing (issue #1898)
+    # Exposed read-only for introspection/testing
     cdef readonly object shape_cache  # Cache for resolved output shapes, keyed by symbolic values
     def __cinit__(self, result_idx, workspace_idx, auto_gm_idx, params, lib):
         # Initialize wrapper with kernel configuration
