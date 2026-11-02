@@ -26,7 +26,7 @@ Scenarios covered (mirroring patterns from
 6. **T.tile + for range** — ``for h_i in range(block_M):
     T.tile.div(acc_o[h_i, :], ...)`` (``LoopVarUsedInVidReducedUbFirstDim``).
 6b. **T.tile + for range, whole-block [1, N] row temp** — row split must
-    not halve the tile-op size (issue #1800 regression).
+    not halve the tile-op size.
 7. **BufferRegion** — ``T.copy(ws[cid, 0:v_block, :], acc_s_ub_)`` GM slice
    → UB (``ModifyBufferRegions``).
 8. **Baseline threads=1** — Pass is a no-op.
@@ -449,7 +449,7 @@ def test_vid_reduction_tile_range(setup_random_seed, target):
 
 # ============================================================
 # 6b) T.tile + for range with whole-block [1, N] row temp
-#     (issue #1800: row split must not halve the tile-op size)
+#     (row split must not halve the tile-op size)
 #
 # Mirrors:
 #   for i in range(block_M):
